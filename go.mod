@@ -1,4 +1,4 @@
-module github.com/danielrbradley/request-body
+module github.com/danielrbradley/go-request-body
 
 go 1.24.2
 
