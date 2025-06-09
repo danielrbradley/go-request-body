@@ -12,48 +12,51 @@ import (
 
 func TestProcessBody(t *testing.T) {
 	t.Parallel()
-	setupServer := func(t *testing.T, h http.HandlerFunc) *httptest.Server {
+	setupServer := func(t *testing.T, h http.HandlerFunc, globalDefaults ...Option) *httptest.Server {
 		t.Helper()
 
 		var handler http.Handler = h
-		handler = RequestBodyHandler(handler, MaxContentLength(-1))
+		handler = RequestBodyHandler(handler, globalDefaults...)
 		ts := httptest.NewServer(handler)
 		t.Cleanup(ts.Close)
 		return ts
 	}
 
-	t.Run("empty no limit", func(t *testing.T) {
-		ts := setupServer(t, func(w http.ResponseWriter, r *http.Request) {
+	echoHandler := func(options ...Option) func(http.ResponseWriter, *http.Request) {
+		return func(w http.ResponseWriter, r *http.Request) {
+			for _, opt := range options {
+				SetRequestBodyOption(r, opt)
+			}
+			bodyBytes, err := io.ReadAll(r.Body)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte("An error occurred"))
+				return
+			}
 			w.WriteHeader(http.StatusOK)
-		})
+			_, _ = w.Write(bodyBytes)
+		}
+	}
+
+	t.Run("empty no limit", func(t *testing.T) {
+		ts := setupServer(t, echoHandler())
 		response, err := ts.Client().Get(ts.URL)
 		assert.NoError(t, err)
 		assert.Equal(t, http.StatusOK, response.StatusCode)
 	})
 
-	t.Run("modify handler limit", func(t *testing.T) {
+	t.Run("lower handler limit", func(t *testing.T) {
 		var limit int64 = 100
-		ts := setupServer(t, func(w http.ResponseWriter, r *http.Request) {
-			// Override the limit in the request context.
-			Set(r, MaxContentLength(limit))
-
-			bodyBytes, err := io.ReadAll(r.Body)
-			if err != nil {
-				if _, ok := err.(*http.MaxBytesError); ok {
-					w.WriteHeader(http.StatusBadRequest)
-					return
-				}
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(bodyBytes)
-		})
+		ts := setupServer(t, echoHandler(MaxContentLength(limit)), MaxContentLength(-1))
 
 		response, err := ts.Client().Post(ts.URL, "application/json",
 			io.NopCloser(bytes.NewBuffer(make([]byte, limit+1))))
 
 		assert.NoError(t, err)
-		assert.Equal(t, http.StatusBadRequest, response.StatusCode)
+		assert.Equal(t, http.StatusRequestEntityTooLarge, response.StatusCode)
+		assert.Equal(t, "413 Request Entity Too Large", response.Status)
+		body, err := io.ReadAll(response.Body)
+		assert.NoError(t, err)
+		assert.Equal(t, "An error occurred", string(body))
 	})
 }

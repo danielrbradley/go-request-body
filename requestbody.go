@@ -9,7 +9,9 @@ import (
 )
 
 func RequestBodyHandler(h http.Handler, defaults ...Option) http.Handler {
-	defaultOptions := options{}
+	defaultOptions := options{
+		onError: DefaultOnError,
+	}
 	for _, opt := range defaults {
 		opt.apply(&defaultOptions)
 	}
@@ -21,6 +23,9 @@ func RequestBodyHandler(h http.Handler, defaults ...Option) http.Handler {
 			h.ServeHTTP(w, r)
 			return
 		}
+
+		// Note: we don't immediately error on content length exceeding the limit,
+		// because we want to allow the downstream handler to override the default limits.
 
 		contentEncoding := r.Header.Get("Content-Encoding")
 		hasGzipEncoding := contentEncoding == "gzip" || contentEncoding == "x-gzip"
@@ -86,7 +91,7 @@ func OnError(fn func(w http.ResponseWriter, r *http.Request, err error) error) O
 	}
 }
 
-func Set(r *http.Request, opts ...Option) {
+func SetRequestBodyOption(r *http.Request, opts ...Option) {
 	if r == nil {
 		return
 	}
@@ -146,6 +151,17 @@ func (r *lazyReader) Read(p []byte) (n int, err error) {
 		return n, r.options.onError(r.writer, r.request, err)
 	}
 	return n, err
+}
+
+// DefaultOnError is the default error handler for the lazyReader.
+// It handles specific errors like MaxBytesError and sets the appropriate HTTP status.
+// For other errors, it simply returns the error.
+func DefaultOnError(w http.ResponseWriter, r *http.Request, err error) error {
+	if _, ok := err.(*http.MaxBytesError); ok {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		return err
+	}
+	return err
 }
 
 func (r *lazyReader) Close() error {
