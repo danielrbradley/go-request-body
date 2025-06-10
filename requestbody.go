@@ -1,38 +1,62 @@
 package requestbody
 
 import (
+	"compress/flate"
 	"compress/gzip"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
+	"slices"
+	"sort"
+	"strings"
 	"sync"
 )
 
+// RequestBodyHandler is middleware for handling content encoding and content length.
+// When configuring the handler, you can specify options such as maximum content length,
+// supported encodings, and an error handler.
+//
+// The configuration is only evaluated at the point of reading the request body,
+// giving handlers the opportunity to override the defaults on a per-request basis.
+//
+// Wrapped handlers can override the default options on a per-request basis using
+// the `SetRequestBodyOption` function to set options on the request context.
 func RequestBodyHandler(h http.Handler, defaults ...Option) http.Handler {
 	defaultOptions := options{
-		onError: DefaultOnError,
+		onError:              DefaultOnError,
+		requireContentLength: false,
+		maxContentLength:     10 * 1024 * 1024, // Default to 10MB
+		supportedEncodings: map[string]Encoding{
+			"gzip":    {GZipEncodingReader, false},
+			"x-gzip":  {GZipEncodingReader, true}, // Alias for gzip
+			"deflate": {DeflateEncodingReader, false},
+		},
 	}
 	for _, opt := range defaults {
 		opt.apply(&defaultOptions)
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Short circuit if the request method does not have a body.
-		// Go's internal http package will already limit the reader to specified content length.
-		if r.ContentLength == 0 {
-			h.ServeHTTP(w, r)
-			return
+		if r.Method == http.MethodOptions {
+			supportedNames := make([]string, 0, len(defaultOptions.supportedEncodings))
+			for name := range defaultOptions.supportedEncodings {
+				if !defaultOptions.supportedEncodings[name].alias {
+					supportedNames = append(supportedNames, name)
+				}
+			}
+			sort.Strings(supportedNames)
+			// Advertise supported encodings in the response headers for OPTIONS requests.
+			w.Header().Set("Accept-Encoding", strings.Join(supportedNames, ", "))
 		}
 
 		// Note: we don't immediately error on content length exceeding the limit,
 		// because we want to allow the downstream handler to override the default limits.
 
-		contentEncoding := r.Header.Get("Content-Encoding")
-		hasGzipEncoding := contentEncoding == "gzip" || contentEncoding == "x-gzip"
-
 		lazyBody := &lazyReader{
-			hasGzipEncoding: hasGzipEncoding,
 			reader:          r.Body,
+			contentLength:   r.ContentLength,
+			contentEncoding: r.Header.Get("Content-Encoding"),
 			options:         defaultOptions,
 			request:         r,
 			writer:          w,
@@ -45,6 +69,74 @@ func RequestBodyHandler(h http.Handler, defaults ...Option) http.Handler {
 	})
 }
 
+// DefaultOnError is the default error handler for the lazyReader.
+// It handles specific errors like MaxBytesError and sets the appropriate HTTP status.
+// For other errors, it simply returns the error.
+func DefaultOnError(w http.ResponseWriter, r *http.Request, err error) error {
+	if bodyError, ok := err.(RequestBodyError); ok {
+		w.WriteHeader(bodyError.RecommendedStatusCode())
+		return err
+	}
+	return err
+}
+
+func GZipEncodingReader(r io.Reader) (io.ReadCloser, error) {
+	return gzip.NewReader(r)
+}
+func DeflateEncodingReader(r io.Reader) (io.ReadCloser, error) {
+	return flate.NewReader(r), nil
+}
+
+type EncodingReader func(r io.Reader) (io.ReadCloser, error)
+
+type RequestBodyError interface {
+	Error() string
+	RecommendedStatusCode() int
+}
+
+type BadRequestError struct {
+	Err error
+}
+
+func (e *BadRequestError) Error() string {
+	return fmt.Sprintf("Bad Request: %v", e.Err)
+}
+func (e *BadRequestError) RecommendedStatusCode() int {
+	return http.StatusBadRequest
+}
+
+type RequestContentTooLargeError struct {
+	Limit int64
+}
+
+func (e *RequestContentTooLargeError) Error() string {
+	return fmt.Sprintf("Content Too Large: %d bytes", e.Limit)
+}
+func (e *RequestContentTooLargeError) RecommendedStatusCode() int {
+	return http.StatusRequestEntityTooLarge
+}
+
+type RequestContentLengthRequiredError struct {
+}
+
+func (e *RequestContentLengthRequiredError) Error() string {
+	return "Content Length Required"
+}
+func (e *RequestContentLengthRequiredError) RecommendedStatusCode() int {
+	return http.StatusLengthRequired
+}
+
+type RequestUnsupportedMediaTypeError struct {
+	Encoding string
+}
+
+func (e *RequestUnsupportedMediaTypeError) Error() string {
+	return "Unsupported Media Type: " + e.Encoding
+}
+func (e *RequestUnsupportedMediaTypeError) RecommendedStatusCode() int {
+	return http.StatusUnsupportedMediaType
+}
+
 type contextType struct{}
 
 var contextKey = contextType{}
@@ -54,31 +146,21 @@ type Option interface {
 }
 
 type options struct {
-	defaultMaxContentLength int64
-	disableGzip             bool
-	onError                 func(w http.ResponseWriter, r *http.Request, err error) error
+	maxContentLength     int64
+	requireContentLength bool
+	supportedEncodings   map[string]Encoding
+	onError              func(w http.ResponseWriter, r *http.Request, err error) error
 }
 
-func MaxContentLength(maxContentLength int64) Option {
-	return optionFunc{
-		f: func(opts *options) {
-			opts.defaultMaxContentLength = maxContentLength
-		},
-	}
+type Encoding struct {
+	reader EncodingReader
+	alias  bool
 }
 
-func DisableGzip() Option {
+func ContentLengthLimit(maxContentLength int64) Option {
 	return optionFunc{
 		f: func(opts *options) {
-			opts.disableGzip = true
-		},
-	}
-}
-
-func EnableGzip() Option {
-	return optionFunc{
-		f: func(opts *options) {
-			opts.disableGzip = false
+			opts.maxContentLength = maxContentLength
 		},
 	}
 }
@@ -113,9 +195,10 @@ func (o optionFunc) apply(opts *options) {
 }
 
 type lazyReader struct {
-	hasGzipEncoding bool
 	once            sync.Once
+	contentLength   int64
 	reader          io.ReadCloser
+	contentEncoding string
 	initErr         error
 	options         options
 	request         *http.Request
@@ -123,22 +206,7 @@ type lazyReader struct {
 }
 
 func (r *lazyReader) Read(p []byte) (n int, err error) {
-	// On first read, perform initialization of reader based on options.
-	r.once.Do(func() {
-		reader := r.reader
-		if r.hasGzipEncoding && !r.options.disableGzip {
-			// If gzip encoding is enabled, wrap the reader with a gzip reader.
-			reader, r.initErr = gzip.NewReader(r.reader)
-			if r.initErr != nil {
-				return
-			}
-		}
-		if r.options.defaultMaxContentLength > 0 {
-			// Limit the reader to the specified max content length.
-			reader = http.MaxBytesReader(r.writer, reader, r.options.defaultMaxContentLength)
-		}
-		r.reader = reader
-	})
+	r.init()
 
 	if r.initErr != nil {
 		if r.options.onError != nil {
@@ -146,22 +214,80 @@ func (r *lazyReader) Read(p []byte) (n int, err error) {
 		}
 		return 0, r.initErr
 	}
+
 	n, err = r.reader.Read(p)
+	if err != nil && err != io.EOF {
+		if mbe, ok := err.(*http.MaxBytesError); ok {
+			err = &RequestContentTooLargeError{
+				Limit: mbe.Limit,
+			}
+		} else {
+			// Wrap other errors in a BadRequestError as we failed while reading the body.
+			err = &BadRequestError{
+				Err: err,
+			}
+		}
+	}
 	if err != nil && r.options.onError != nil {
 		return n, r.options.onError(r.writer, r.request, err)
 	}
 	return n, err
 }
 
-// DefaultOnError is the default error handler for the lazyReader.
-// It handles specific errors like MaxBytesError and sets the appropriate HTTP status.
-// For other errors, it simply returns the error.
-func DefaultOnError(w http.ResponseWriter, r *http.Request, err error) error {
-	if _, ok := err.(*http.MaxBytesError); ok {
-		w.WriteHeader(http.StatusRequestEntityTooLarge)
-		return err
-	}
-	return err
+func (r *lazyReader) init() {
+	r.once.Do(func() {
+		if r.contentLength == 0 {
+			return // If the content length is zero, we don't need to process the body.
+		}
+
+		// Fail if content length not provided but is required.
+		if r.contentLength < 0 && r.options.requireContentLength {
+			r.initErr = &RequestContentLengthRequiredError{}
+			return
+		}
+
+		// Fail fast if content length exceeds the maximum allowed limit.
+		if r.options.maxContentLength > -1 && r.contentLength > r.options.maxContentLength {
+			r.initErr = &RequestContentTooLargeError{
+				Limit: r.options.maxContentLength,
+			}
+			return
+		}
+		var encodings []EncodingReader
+		if r.contentEncoding != "" {
+			for _, encoding := range strings.Split(r.contentEncoding, ",") {
+				trimmed := strings.TrimSpace(encoding)
+				if encoder, supported := r.options.supportedEncodings[trimmed]; supported {
+					encodings = append(encodings, encoder.reader)
+				} else {
+					// If the encoding is not supported, return 415 Unsupported Media Type.
+					// https://www.rfc-editor.org/rfc/rfc9110.html#name-415-unsupported-media-type
+					r.initErr = &RequestUnsupportedMediaTypeError{
+						Encoding: trimmed,
+					}
+					return
+				}
+			}
+		}
+
+		reader := r.reader
+		slices.Reverse(encodings) // Reverse the order to apply the last encoding first.
+		// Unwrap each encoding reader in the order they were provided.
+		for _, encoding := range encodings {
+			// Apply each encoding reader to the reader.
+			wrappedReader, err := encoding(reader)
+			if err != nil {
+				r.initErr = err
+				return
+			}
+			reader = wrappedReader
+		}
+		if r.options.maxContentLength > 0 {
+			// Limit the reader to the specified max content length.
+			reader = http.MaxBytesReader(r.writer, reader, r.options.maxContentLength)
+		}
+		r.reader = reader
+	})
 }
 
 func (r *lazyReader) Close() error {
