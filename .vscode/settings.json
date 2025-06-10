@@ -1,0 +1,4 @@
+{
+  "go.coverMode": "default",
+  "go.coverOnTestPackage": true
+}

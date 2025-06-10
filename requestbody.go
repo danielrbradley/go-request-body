@@ -154,7 +154,8 @@ type options struct {
 
 type Encoding struct {
 	reader EncodingReader
-	alias  bool
+	// alias skips the encoding being advertised in the Accept-Encoding header.
+	alias bool
 }
 
 func ContentLengthLimit(maxContentLength int64) Option {
@@ -169,6 +170,39 @@ func OnError(fn func(w http.ResponseWriter, r *http.Request, err error) error) O
 	return optionFunc{
 		f: func(opts *options) {
 			opts.onError = fn
+		},
+	}
+}
+
+func RequireContentLength(require bool) Option {
+	return optionFunc{
+		f: func(opts *options) {
+			opts.requireContentLength = require
+		},
+	}
+}
+
+func SupportEncoding(name string, reader EncodingReader) Option {
+	return optionFunc{
+		f: func(opts *options) {
+			if opts.supportedEncodings == nil {
+				opts.supportedEncodings = make(map[string]Encoding)
+			}
+			opts.supportedEncodings[name] = Encoding{
+				reader: reader,
+				alias:  false,
+			}
+		},
+	}
+}
+
+func DisableEncoding(name string) Option {
+	return optionFunc{
+		f: func(opts *options) {
+			if opts.supportedEncodings == nil {
+				return // No encodings to disable.
+			}
+			delete(opts.supportedEncodings, name)
 		},
 	}
 }

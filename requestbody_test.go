@@ -155,11 +155,26 @@ func TestProcessBody(t *testing.T) {
 		assert.Len(t, responseBody, 0)
 	})
 
+	t.Run("require content length missing", func(t *testing.T) {
+		t.Parallel()
+		ts := setupServer(t, echoHandler(), RequireContentLength(true))
+
+		// New request + io.NopCloser avoids setting length automatically.
+		body := io.NopCloser(bytes.NewBuffer(make([]byte, 100)))
+		req, err := http.NewRequest(http.MethodPost, ts.URL, body)
+		assert.NoError(t, err)
+		response, err := ts.Client().Do(req)
+
+		assert.NoError(t, err)
+		defer response.Body.Close()
+		assert.Equal(t, http.StatusLengthRequired, response.StatusCode)
+	})
+
 	t.Run("override handler limit", func(t *testing.T) {
 		t.Parallel()
 		var limit int64 = 100
 		handler := echoHandler(ContentLengthLimit(limit))
-		ts := setupServer(t, handler, ContentLengthLimit(-1))
+		ts := setupServer(t, handler)
 
 		response, err := ts.Client().Post(ts.URL, "application/json",
 			io.NopCloser(bytes.NewBuffer(make([]byte, limit+1))))
@@ -185,8 +200,8 @@ func setupServer(t *testing.T, h http.HandlerFunc, globalDefaults ...Option) *ht
 
 func echoHandler(options ...Option) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		for _, opt := range options {
-			SetRequestBodyOption(r, opt)
+		if len(options) > 0 {
+			SetRequestBodyOption(r, options...)
 		}
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
