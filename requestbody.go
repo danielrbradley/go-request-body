@@ -24,7 +24,7 @@ import (
 // the `SetRequestBodyOption` function to set options on the request context.
 func RequestBodyHandler(h http.Handler, defaults ...Option) http.Handler {
 	defaultOptions := options{
-		onError:              DefaultOnError,
+		onError:              SetStatusOnError,
 		requireContentLength: false,
 		maxContentLength:     10 * 1024 * 1024, // Default to 10MB
 		supportedEncodings: map[string]Encoding{
@@ -69,14 +69,19 @@ func RequestBodyHandler(h http.Handler, defaults ...Option) http.Handler {
 	})
 }
 
-// DefaultOnError is the default error handler for the lazyReader.
-// It handles specific errors like MaxBytesError and sets the appropriate HTTP status.
-// For other errors, it simply returns the error.
-func DefaultOnError(w http.ResponseWriter, r *http.Request, err error) error {
+// SetStatusOnError writes the appropriate header status code for the RequestBodyError
+// and returns the error to the reader of the body.
+func SetStatusOnError(w http.ResponseWriter, r *http.Request, err error) error {
 	if bodyError, ok := err.(RequestBodyError); ok {
 		w.WriteHeader(bodyError.RecommendedStatusCode())
 		return err
 	}
+	return err
+}
+
+// PassThroughOnError will not modify the response, leaving it up to the reader of the
+// body to handle RequestBodyError errors.
+func PassThroughOnError(w http.ResponseWriter, r *http.Request, err error) error {
 	return err
 }
 
@@ -311,7 +316,9 @@ func (r *lazyReader) init() {
 			// Apply each encoding reader to the reader.
 			wrappedReader, err := encoding(reader)
 			if err != nil {
-				r.initErr = err
+				r.initErr = &BadRequestError{
+					Err: fmt.Errorf("failed to create encoding reader for %s: %w", r.contentEncoding, err),
+				}
 				return
 			}
 			reader = wrappedReader
