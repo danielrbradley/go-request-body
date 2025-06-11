@@ -27,7 +27,7 @@ func RequestBodyHandler(h http.Handler, defaults ...Option) http.Handler {
 		handleError:          StatusOnlyRequestBodyErrorHandler,
 		requireContentLength: false,
 		maxContentLength:     10 * 1024 * 1024, // Default to 10MB
-		supportedEncodings: map[string]Encoding{
+		supportedEncodings: map[string]encoding{
 			"gzip":    {GZipEncodingReader, false},
 			"x-gzip":  {GZipEncodingReader, true}, // Alias for gzip
 			"deflate": {DeflateEncodingReader, false},
@@ -88,11 +88,18 @@ func DeflateEncodingReader(r io.Reader) (io.ReadCloser, error) {
 
 type EncodingReader func(r io.Reader) (io.ReadCloser, error)
 
+// RequestBodyError is an interface for errors that can occur while processing the request body.
+// Possible errors are: BadRequestError, RequestContentTooLargeError,
+// RequestContentLengthRequiredError, and RequestUnsupportedMediaTypeError.
 type RequestBodyError interface {
 	Error() string
 	RecommendedStatusCode() int
 }
 
+// BadRequestError is returned when the request body is malformed or cannot be processed.
+// The recommended status code for this error is 400 Bad Request.
+//
+// See: https://www.rfc-editor.org/rfc/rfc9110.html#name-400-bad-request
 type BadRequestError struct {
 	Err error
 }
@@ -104,6 +111,10 @@ func (e *BadRequestError) RecommendedStatusCode() int {
 	return http.StatusBadRequest
 }
 
+// RequestContentTooLargeError is returned when the request body exceeds the maximum allowed content length.
+// The recommended status code for this error is 413 Request Entity Too Large.
+//
+// See: https://www.rfc-editor.org/rfc/rfc9110.html#name-413-content-too-large
 type RequestContentTooLargeError struct {
 	Limit int64
 }
@@ -115,6 +126,11 @@ func (e *RequestContentTooLargeError) RecommendedStatusCode() int {
 	return http.StatusRequestEntityTooLarge
 }
 
+// RequestContentLengthRequiredError is returned when the request does not have a Content-Length header
+// set, but the server requires it to be present.
+// The recommended status code for this error is 411 Length Required.
+//
+// See: https://www.rfc-editor.org/rfc/rfc9110.html#name-411-length-required
 type RequestContentLengthRequiredError struct {
 }
 
@@ -125,6 +141,11 @@ func (e *RequestContentLengthRequiredError) RecommendedStatusCode() int {
 	return http.StatusLengthRequired
 }
 
+// RequestUnsupportedMediaTypeError is returned when the request's Content-Encoding
+// header contains an encoding that is not supported by the server.
+// The recommended status code for this error is 415 Unsupported Media Type.
+//
+// See: https://www.rfc-editor.org/rfc/rfc9110.html#name-415-unsupported-media-type
 type RequestUnsupportedMediaTypeError struct {
 	Encoding string
 }
@@ -140,6 +161,9 @@ type contextType struct{}
 
 var contextKey = contextType{}
 
+// Option is a functional option for configuring the request body handler.
+// Valid options are ContentLengthLimit, RequireContentLength, SupportEncoding, DisableEncoding,
+// HandleRequestBodyError, and ReturnOnError.
 type Option interface {
 	apply(*options)
 }
@@ -147,16 +171,20 @@ type Option interface {
 type options struct {
 	maxContentLength     int64
 	requireContentLength bool
-	supportedEncodings   map[string]Encoding
+	supportedEncodings   map[string]encoding
 	handleError          RequestBodyErrorHandler
 }
 
-type Encoding struct {
+type encoding struct {
 	reader EncodingReader
 	// alias skips the encoding being advertised in the Accept-Encoding header.
 	alias bool
 }
 
+// ContentLengthLimit sets the maximum content length for the request body.
+// If the request body exceeds this limit, a RequestContentTooLargeError will be returned.
+// The default limit is 10MB (10 * 1024 * 1024 bytes).
+// If you want to disable the limit, use ContentLengthLimit(-1).
 func ContentLengthLimit(maxContentLength int64) Option {
 	return optionFunc{
 		f: func(opts *options) {
@@ -196,6 +224,8 @@ func ReturnOnError() Option {
 	}
 }
 
+// RequireContentLength will require the request to have a Content-Length header
+// set to a non-negative value, if set to true.
 func RequireContentLength(require bool) Option {
 	return optionFunc{
 		f: func(opts *options) {
@@ -204,13 +234,12 @@ func RequireContentLength(require bool) Option {
 	}
 }
 
+// SupportEncoding adds a new encoding to the list of supported encodings.
+// If the encoding already exists, it will be replaced.
 func SupportEncoding(name string, reader EncodingReader) Option {
 	return optionFunc{
 		f: func(opts *options) {
-			if opts.supportedEncodings == nil {
-				opts.supportedEncodings = make(map[string]Encoding)
-			}
-			opts.supportedEncodings[name] = Encoding{
+			opts.supportedEncodings[name] = encoding{
 				reader: reader,
 				alias:  false,
 			}
@@ -218,6 +247,8 @@ func SupportEncoding(name string, reader EncodingReader) Option {
 	}
 }
 
+// DisableEncoding removes the specified encoding from the list of supported encodings.
+// If the encoding is not supported, it will have no effect.
 func DisableEncoding(name string) Option {
 	return optionFunc{
 		f: func(opts *options) {
@@ -229,6 +260,10 @@ func DisableEncoding(name string) Option {
 	}
 }
 
+// SetRequestBodyOption sets options for the request body handler on the request context.
+// These options will override the default options set in the RequestBodyHandler middleware.
+// This allows handlers to customize the behaviour of the request body processing
+// on a per-request basis.
 func SetRequestBodyOption(r *http.Request, opts ...Option) {
 	if r == nil {
 		return
