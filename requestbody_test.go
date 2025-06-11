@@ -190,6 +190,25 @@ func TestProcessBody(t *testing.T) {
 		assertNoError(t, err)
 		assertEqual(t, "", string(body))
 	})
+
+	t.Run("custom error handler", func(t *testing.T) {
+		t.Parallel()
+		onRequestBodyError := func(w http.ResponseWriter, r *http.Request, err RequestBodyError) {
+			w.WriteHeader(http.StatusTeapot) // Custom status code
+			_, _ = w.Write([]byte("Custom error: " + err.Error()))
+		}
+		ts := setupServer(t, echoHandler(), ContentLengthLimit(100), HandleRequestBodyError(onRequestBodyError))
+
+		response, err := ts.Client().Post(ts.URL, "application/json",
+			io.NopCloser(bytes.NewBuffer(make([]byte, 101)))) // Over limit
+
+		assertNoError(t, err)
+		defer response.Body.Close()
+		assertEqual(t, http.StatusTeapot, response.StatusCode)
+		body, err := io.ReadAll(response.Body)
+		assertNoError(t, err)
+		assertEqual(t, "Custom error: Content Too Large: greater than 100 bytes", string(body))
+	})
 }
 
 func setupServer(t *testing.T, h http.HandlerFunc, globalDefaults ...Option) *httptest.Server {
@@ -209,9 +228,6 @@ func echoHandler(options ...Option) func(http.ResponseWriter, *http.Request) {
 		}
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
-			if _, ok := err.(RequestBodyError); ok {
-				return
-			}
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte("An error occurred"))
 			return

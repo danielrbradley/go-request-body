@@ -24,7 +24,7 @@ import (
 // the `SetRequestBodyOption` function to set options on the request context.
 func RequestBodyHandler(h http.Handler, defaults ...Option) http.Handler {
 	defaultOptions := options{
-		onError:              SetStatusOnError,
+		handleError:          StatusOnlyRequestBodyErrorHandler,
 		requireContentLength: false,
 		maxContentLength:     10 * 1024 * 1024, // Default to 10MB
 		supportedEncodings: map[string]Encoding{
@@ -65,24 +65,18 @@ func RequestBodyHandler(h http.Handler, defaults ...Option) http.Handler {
 		r = r.WithContext(context.WithValue(r.Context(), contextKey, &lazyBody.options))
 		r.Body = lazyBody
 
+		defer func() {
+			if v := recover(); v != nil {
+				if bodyError, ok := v.(bodyErrorPanic); ok {
+					bodyError.handler(w, r, bodyError.err)
+				} else {
+					// If it's not a RequestBodyError, re-panic to let it bubble up.
+					panic(v)
+				}
+			}
+		}()
 		h.ServeHTTP(w, r)
 	})
-}
-
-// SetStatusOnError writes the appropriate header status code for the RequestBodyError
-// and returns the error to the reader of the body.
-func SetStatusOnError(w http.ResponseWriter, r *http.Request, err error) error {
-	if bodyError, ok := err.(RequestBodyError); ok {
-		w.WriteHeader(bodyError.RecommendedStatusCode())
-		return err
-	}
-	return err
-}
-
-// PassThroughOnError will not modify the response, leaving it up to the reader of the
-// body to handle RequestBodyError errors.
-func PassThroughOnError(w http.ResponseWriter, r *http.Request, err error) error {
-	return err
 }
 
 func GZipEncodingReader(r io.Reader) (io.ReadCloser, error) {
@@ -115,7 +109,7 @@ type RequestContentTooLargeError struct {
 }
 
 func (e *RequestContentTooLargeError) Error() string {
-	return fmt.Sprintf("Content Too Large: %d bytes", e.Limit)
+	return fmt.Sprintf("Content Too Large: greater than %d bytes", e.Limit)
 }
 func (e *RequestContentTooLargeError) RecommendedStatusCode() int {
 	return http.StatusRequestEntityTooLarge
@@ -154,7 +148,7 @@ type options struct {
 	maxContentLength     int64
 	requireContentLength bool
 	supportedEncodings   map[string]Encoding
-	onError              func(w http.ResponseWriter, r *http.Request, err error) error
+	handleError          RequestBodyErrorHandler
 }
 
 type Encoding struct {
@@ -171,10 +165,33 @@ func ContentLengthLimit(maxContentLength int64) Option {
 	}
 }
 
-func OnError(fn func(w http.ResponseWriter, r *http.Request, err error) error) Option {
+type RequestBodyErrorHandler func(w http.ResponseWriter, r *http.Request, err RequestBodyError)
+
+// StatusOnlyRequestBodyErrorHandler is the default error handler that only writes the status code
+// recommended by the RequestBodyError interface.
+func StatusOnlyRequestBodyErrorHandler(w http.ResponseWriter, r *http.Request, err RequestBodyError) {
+	w.WriteHeader(err.RecommendedStatusCode())
+}
+
+// HandleRequestBodyError will halt request processing using a panic which will be recovered by the middleware
+// and use the handler to write a response.
+// Passing nil for the handler will disable this behaviour and return the error to the reader of the body which
+// is the same as using the ReturnOnError option.
+// If not specified, the StatusOnlyRequestBodyErrorHandler will be used.
+func HandleRequestBodyError(handler RequestBodyErrorHandler) Option {
 	return optionFunc{
 		f: func(opts *options) {
-			opts.onError = fn
+			opts.handleError = handler
+		},
+	}
+}
+
+// ReturnOnError will not modify the response, leaving it up to the reader of the
+// body to handle RequestBodyError errors.
+func ReturnOnError() Option {
+	return optionFunc{
+		f: func(opts *options) {
+			opts.handleError = nil
 		},
 	}
 }
@@ -248,10 +265,7 @@ func (r *lazyReader) Read(p []byte) (n int, err error) {
 	r.init()
 
 	if r.initErr != nil {
-		if r.options.onError != nil {
-			return 0, r.options.onError(r.writer, r.request, r.initErr)
-		}
-		return 0, r.initErr
+		return 0, handleError(r.options.handleError, r.initErr)
 	}
 
 	n, err = r.reader.Read(p)
@@ -267,8 +281,8 @@ func (r *lazyReader) Read(p []byte) (n int, err error) {
 			}
 		}
 	}
-	if err != nil && r.options.onError != nil {
-		return n, r.options.onError(r.writer, r.request, err)
+	if err != nil {
+		return n, handleError(r.options.handleError, err)
 	}
 	return n, err
 }
@@ -333,10 +347,22 @@ func (r *lazyReader) init() {
 
 func (r *lazyReader) Close() error {
 	if r.initErr != nil {
-		if r.options.onError != nil {
-			return r.options.onError(r.writer, r.request, r.initErr)
-		}
-		return r.initErr
+		return handleError(r.options.handleError, r.initErr)
 	}
 	return r.reader.Close()
+}
+
+type bodyErrorPanic struct {
+	err     RequestBodyError
+	handler RequestBodyErrorHandler
+}
+
+func handleError(handleBodyError RequestBodyErrorHandler, err error) error {
+	if handleBodyError != nil {
+		if bodyError, ok := err.(RequestBodyError); ok {
+			panic(bodyErrorPanic{bodyError, handleBodyError})
+		}
+	}
+
+	return err
 }
